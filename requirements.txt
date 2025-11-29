@@ -1,4 +1,0 @@
-streamlit
-librosa
-tensorflow==2.15.0
-numpy
