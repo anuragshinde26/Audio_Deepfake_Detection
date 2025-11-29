@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 type ApiResponse = {
   prediction?: "fake" | "real" | string;
   confidence?: number; // backend returns 0..1 float usually
+  probabilities?: { fake: number; real: number };
   spectrogram_path?: string;
   spectrogram?: string;
   spectral_heuristic?: number;
@@ -33,8 +34,8 @@ export const ResultsDisplay: React.FC<ResultsDisplayProps> = ({ result, onReset 
   const API_BASE = (import.meta.env.VITE_API_URL as string) || "http://localhost:8000";
 
   const normalized = useMemo(() => {
-    if ((result as any).classification !== undefined &&
-        typeof (result as any).confidence === "number") {
+    // already normalized shape
+    if ((result as any).classification !== undefined && typeof (result as any).confidence === "number") {
       const r = result as any;
       return {
         classification: r.classification as "genuine" | "deepfake",
@@ -47,17 +48,22 @@ export const ResultsDisplay: React.FC<ResultsDisplayProps> = ({ result, onReset 
     }
 
     const api = result as ApiResponse;
+    // classification mapping
     const classification =
       api.prediction && (api.prediction === "fake" || api.prediction === "deepfake")
         ? "deepfake"
         : "genuine";
 
+    // confidence: try confidence -> probabilities.fake -> 0
     let confidencePercent = 0;
     if (typeof api.confidence === "number") {
       confidencePercent = api.confidence <= 1 ? api.confidence * 100 : api.confidence;
+    } else if (api.probabilities && typeof api.probabilities.fake === "number") {
+      confidencePercent = api.probabilities.fake <= 1 ? api.probabilities.fake * 100 : api.probabilities.fake;
     }
     confidencePercent = Math.round(confidencePercent * 100) / 100;
 
+    // spectrogram handling (data-uri or relative path)
     let spectrogramUrl: string | undefined = undefined;
     if (api.spectrogram && typeof api.spectrogram === "string") {
       spectrogramUrl = api.spectrogram;
@@ -81,9 +87,13 @@ export const ResultsDisplay: React.FC<ResultsDisplayProps> = ({ result, onReset 
 
   const isDeepfake = normalized.classification === "deepfake";
 
-  // --- FIXED: deepfakeProbability should ALWAYS be normalized.confidence ---
+  // deepfakeProbability is always normalized.confidence (0..100)
   const deepfakeProbability = normalized.confidence;
-  const genuineProbability  = Math.round((100 - normalized.confidence) * 100) / 100;
+  const genuineProbability = Math.round((100 - deepfakeProbability) * 100) / 100;
+
+  // TOP number: show the winning-class probability (fix for previous inversion bug)
+  const topDisplayPercent = isDeepfake ? deepfakeProbability : genuineProbability;
+  const topLabel = isDeepfake ? "Confidence (Deepfake)" : "Confidence (Genuine)";
 
   return (
     <section className="py-20 px-4">
@@ -106,16 +116,18 @@ export const ResultsDisplay: React.FC<ResultsDisplayProps> = ({ result, onReset 
                   {isDeepfake ? "Deepfake Detected" : "Genuine Audio"}
                 </h2>
                 <p className="text-muted-foreground">
-                  {isDeepfake ? "Our AI analysis has detected signs of manipulation in this audio" : "This audio appears to be authentic and unmodified"}
+                  {isDeepfake
+                    ? "Our AI analysis has detected signs of manipulation in this audio"
+                    : "This audio appears to be authentic and unmodified"}
                 </p>
               </div>
             </div>
 
             <div className="text-center">
               <div className={`text-5xl font-bold mb-2 ${isDeepfake ? "text-destructive" : "text-success"}`}>
-                {deepfakeProbability}%
+                {topDisplayPercent}%
               </div>
-              <p className="text-sm text-muted-foreground">Confidence (deepfake probability)</p>
+              <p className="text-sm text-muted-foreground">{topLabel}</p>
             </div>
           </div>
         </Card>
@@ -197,3 +209,5 @@ export const ResultsDisplay: React.FC<ResultsDisplayProps> = ({ result, onReset 
     </section>
   );
 };
+
+export default ResultsDisplay;

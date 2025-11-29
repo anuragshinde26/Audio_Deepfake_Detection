@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple, List
 
 import numpy as np
 import librosa
@@ -17,7 +17,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -98,7 +98,6 @@ def _convert_to_wav_if_needed(input_path: str, target_sr: int = 16000) -> str:
     """
     input_path = str(input_path)
     if input_path.lower().endswith(".wav"):
-        # optionally resample later when loading with librosa
         return input_path
 
     out_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
@@ -115,9 +114,7 @@ def _convert_to_wav_if_needed(input_path: str, target_sr: int = 16000) -> str:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         return out_path
     except subprocess.CalledProcessError as e:
-        # include stderr to help debugging
         err = e.stderr if hasattr(e, "stderr") else str(e)
-        # cleanup the failed file
         try:
             os.remove(out_path)
         except Exception:
@@ -161,6 +158,81 @@ def save_spectrogram_bytes(png_bytes: bytes, filename: Optional[str] = None) -> 
         f.write(png_bytes)
     return f"/static/spectrograms/{filename}"
 
+# ---------- New: chunked/sliding-window inference helper ----------
+def predict_on_wav_aggregate(
+    wav_path: str,
+    model,
+    sr: int = 16000,
+    n_mfcc: int = 40,
+    max_len: int = 500,
+    hop_seconds: float = 0.8
+) -> Tuple[float, List[float], int, Tuple[int,int]]:
+    """
+    Slide over the MFCC time axis and run model on blocks of width `max_len`.
+    Returns (avg_fake_prob, window_probs, window_count, mfcc_shape)
+
+    hop_seconds: approximate seconds to step between windows (overlap if hop < window duration).
+    Note: the conversion from seconds->frames uses a rough hop_length of 512 samples.
+    Adjust if you know exact training hop_length.
+    """
+    # Load full audio and MFCC
+    y, _ = librosa.load(wav_path, sr=sr, mono=True)
+    mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
+    T = mfccs.shape[1]
+
+    # Convert hop_seconds to approximate frames using typical hop_length ~ 512
+    # (This is approximate; if you used different hop_length in training adjust accordingly)
+    hop_frames = max(1, int(hop_seconds * (sr / 512.0)))
+
+    window_probs: List[float] = []
+
+    def pred_from_mfcc_block(block: np.ndarray) -> float:
+        # block shape: (n_mfcc, window_frames)
+        features = block.reshape(1, block.shape[0], block.shape[1], 1)
+        pred = model.predict(features)
+        # handle different model outputs robustly
+        try:
+            # sigmoid single-output
+            return float(pred[0][0])
+        except Exception:
+            if isinstance(pred, np.ndarray) and pred.shape[-1] == 2:
+                return float(pred[0][1])
+            return float(np.max(pred))
+
+    if T <= max_len:
+        # pad or trim to max_len
+        if T < max_len:
+            block = np.pad(mfccs, ((0,0),(0, max_len - T)), mode='constant')
+        else:
+            block = mfccs[:, :max_len]
+        try:
+            window_probs.append(pred_from_mfcc_block(block))
+        except Exception as e:
+            # if single-window prediction fails, raise so caller can handle
+            raise RuntimeError(f"Model prediction failed on single window: {e}")
+    else:
+        start = 0
+        while start + max_len <= T:
+            block = mfccs[:, start:start+max_len]
+            try:
+                window_probs.append(pred_from_mfcc_block(block))
+            except Exception as e:
+                raise RuntimeError(f"Model prediction failed on window at start {start}: {e}")
+            start += hop_frames
+        # final tail window
+        if start < T:
+            if T >= max_len:
+                block = mfccs[:, -max_len:]
+            else:
+                block = np.pad(mfccs, ((0,0),(0, max_len - T)), mode='constant')
+            try:
+                window_probs.append(pred_from_mfcc_block(block))
+            except Exception as e:
+                raise RuntimeError(f"Model prediction failed on final window: {e}")
+
+    avg_prob = float(np.mean(window_probs)) if window_probs else 0.0
+    return avg_prob, window_probs, len(window_probs), (mfccs.shape[0], mfccs.shape[1])
+
 # ---------- Endpoints ----------
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
@@ -192,19 +264,12 @@ async def predict(file: UploadFile = File(...)):
         if model is None:
             raise HTTPException(status_code=500, detail="Model not loaded on server")
 
+        # ---------- Use aggregate/chunked inference ----------
         try:
-            features = extract_mfcc_from_wavfile(temp_wav_path)
-            pred = model.predict(features)
-            if isinstance(pred, np.ndarray):
-                try:
-                    fake_prob = float(pred[0][0])
-                except Exception:
-                    if pred.shape[-1] == 2:
-                        fake_prob = float(pred[0][1])
-                    else:
-                        fake_prob = float(np.max(pred))
-            else:
-                fake_prob = float(pred)
+            avg_prob, window_probs, window_count, mf_shape = predict_on_wav_aggregate(
+                temp_wav_path, model=model, sr=16000, n_mfcc=40, max_len=500, hop_seconds=0.8
+            )
+            fake_prob = avg_prob
             real_prob = 1.0 - fake_prob
             label = "fake" if fake_prob >= 0.5 else "real"
         except Exception as e:
@@ -220,7 +285,11 @@ async def predict(file: UploadFile = File(...)):
             "spectrogram_path": spect_rel,
             "file_name": file.filename or "uploaded_audio",
             "analysis_time": elapsed,
-            "spectral_heuristic": None
+            "spectral_heuristic": None,
+            # debugging fields (optional) - remove if you don't want these sent to frontend
+            "window_count": window_count,
+            "window_probs": window_probs,
+            "mfcc_shape": mf_shape,
         }
         return JSONResponse(content=result)
     finally:
@@ -299,7 +368,7 @@ async def predict_url(request: Request):
         except RuntimeError as e:
             raise HTTPException(status_code=500, detail=f"Audio conversion failed: {e}")
 
-        # spectrogram, features and inference
+        # spectrogram, features and aggregate inference
         try:
             png_bytes = make_mel_spectrogram_image_bytes_from_wav(wav_path)
             spect_rel = save_spectrogram_bytes(png_bytes)
@@ -311,15 +380,10 @@ async def predict_url(request: Request):
             raise HTTPException(status_code=500, detail="Model not loaded on server")
 
         try:
-            features = extract_mfcc_from_wavfile(wav_path)
-            pred = model.predict(features)
-            try:
-                fake_prob = float(pred[0][0])
-            except Exception:
-                if isinstance(pred, np.ndarray) and pred.shape[-1] == 2:
-                    fake_prob = float(pred[0][1])
-                else:
-                    fake_prob = float(np.max(pred))
+            avg_prob, window_probs, window_count, mf_shape = predict_on_wav_aggregate(
+                wav_path, model=model, sr=16000, n_mfcc=40, max_len=500, hop_seconds=0.8
+            )
+            fake_prob = avg_prob
             real_prob = 1.0 - fake_prob
             label = "fake" if fake_prob >= 0.5 else "real"
         except Exception as e:
@@ -335,7 +399,11 @@ async def predict_url(request: Request):
             "spectrogram_path": spect_rel,
             "file_name": youtube_url,
             "analysis_time": elapsed,
-            "spectral_heuristic": None
+            "spectral_heuristic": None,
+            # debugging fields
+            "window_count": window_count,
+            "window_probs": window_probs,
+            "mfcc_shape": mf_shape,
         }
         return JSONResponse(response)
     finally:
